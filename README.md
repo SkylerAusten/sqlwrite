@@ -10,14 +10,34 @@ as an extension to SQLite3 (more to come). In addition to generating
 queries, SQLwrite also produces suggestions to improve query
 performance (e.g., creating new indices).
 
-*NOTE*: To use SQLwrite, you must first set up an OpenAI API key. If you
-already have an API key, you can set it as an environment variable
-called `OPENAI_API_KEY`. If you do not have one yet,
-you can get a key here: https://platform.openai.com/account/api-keys
+## Supported AI Providers
 
-```
+SQLwrite supports two AI backends:
+
+### Option 1: OpenAI (GPT-4)
+
+```bash
 export OPENAI_API_KEY=<your-api-key>
 ```
+
+Get a key at: https://platform.openai.com/account/api-keys
+
+### Option 2: AWS Bedrock (Claude)
+
+```bash
+export AWS_ACCESS_KEY_ID=<your-access-key>
+export AWS_SECRET_ACCESS_KEY=<your-secret-key>
+export AWS_REGION=us-east-1  # optional, defaults to us-east-1
+```
+
+Or use the AWS credentials file (`~/.aws/credentials`):
+```ini
+[default]
+aws_access_key_id = <your-access-key>
+aws_secret_access_key = <your-secret-key>
+```
+
+AWS Bedrock uses Claude 3 Sonnet by default. Ensure you have enabled Claude model access in your AWS Bedrock console.
 
 ## Examples
 
@@ -26,7 +46,7 @@ These example queries use a [large SQLite database with multiple tables](https:/
 ### Getting started
 
 ```
-% export OPENAI_API_KEY=<your-api-key>
+% export OPENAI_API_KEY=<your-api-key>  # or use AWS credentials
 % ./sqlite3 Chinook_Sqlite.sqlite
 sqlite> .load sqlwrite
 SQLwrite extension successfully initialized. You can now use natural language queries like "select ask('show me all artists.');".
@@ -91,7 +111,42 @@ sqlite> select ask('Haz una lista de todos los músicos cuyos nombres empiezan c
 
 ## Installation
 
-Download and run `make`. Currently Mac and Linux only. You may need to install the `curl` library.
+### CMake Build (Recommended)
+
+```bash
+# Install dependencies (Ubuntu/Debian)
+sudo apt install libcurl4-gnutls-dev libssl-dev cmake
+
+# Install dependencies (Fedora/RHEL)
+sudo dnf install libcurl-devel openssl-devel cmake
+
+# Build with latest SQLite (fetched automatically)
+cmake -B build
+cmake --build build
+
+# Or use presets
+cmake --preset default && cmake --build --preset default
+```
+
+#### Build Options
+
+| Option | Description |
+|--------|-------------|
+| `-DUSE_BUNDLED_SQLITE=ON` | Use bundled SQLite amalgamation |
+| `-DUSE_SYSTEM_SQLITE=ON` | Use system-installed SQLite |
+| `-DUSE_SYSTEM_FMT=ON` | Use system fmt library |
+
+```bash
+# Example: build with bundled SQLite
+cmake -B build -DUSE_BUNDLED_SQLITE=ON
+cmake --build build
+```
+
+### Legacy Makefile Build
+
+```bash
+make
+```
 
 ### Ubuntu
 
@@ -101,27 +156,28 @@ sudo apt install libcurl4-gnutls-dev
 
 ## Usage
 
-Either use the built-in SQLite (if it was built to allow extensions), or run the generated `sqlite3` file on your database:
+After building, run the SQLite shell with sqlwrite built-in:
 
-```
-./sqlite3 my_database.db
-```
-
-and then run the following command to load the SQLwrite extension:
-
-```
-select load_extension("the_path_to_your_sqlwrite_directory/sqlwrite");
+```bash
+cd build
+LD_LIBRARY_PATH=. ./sqlwrite-bin my_database.db
 ```
 
-or:
+The `ask()` function is automatically available - no need to load the extension:
+
 ```
-.load the_path_to_your_sqlwrite_directory/sqlwrite
+SQLwrite extension initialized with AWS Bedrock (Claude).
+Use natural language queries like: select ask('show me all artists.');
+sqlite> select ask('show me all customers from France');
 ```
 
-You can now issue English language queries by using the `ask` function:
+### Loading as Extension
 
-```sql
-SELECT ask('(whatever you want)');
+You can also load sqlwrite into any SQLite shell that supports extensions:
+
+```bash
+sqlite3 my_database.db
+sqlite> .load /path/to/build/sqlwrite
 ```
 
 ## Acknowledgements

@@ -22,7 +22,7 @@
 #define RETRY_ON_EMPTY_RESULTS 1
 #endif
 #if !defined(RETRY_ON_TOO_MANY_RESULTS)
-#define RETRY_ON_TOO_MANY_RESULTS 1
+#define RETRY_ON_TOO_MANY_RESULTS 0
 #endif
 #if !defined(MAX_RETRIES_ON_RESULTS)
 #define MAX_RETRIES_ON_RESULTS 5
@@ -48,12 +48,17 @@
 #include <fmt/core.h>
 #include <fmt/format.h>
 
-#include "openai.hpp"
+#ifdef SQLWRITE_AUTOLOAD
+// Built-in mode - use regular SQLite API
+#include <sqlite3.h>
+#else
+// Extension mode - use extension API
 #include "sqlite3ext.h"
-
-#include "aistream.hpp"
-
 SQLITE_EXTENSION_INIT1;
+#endif
+
+#include "llm_backend.hpp"
+#include "aistream.hpp"
 
 std::string prompt("[SQLwrite] ");
 
@@ -312,11 +317,11 @@ static bool translateQuery(ai::aistream& ai,
     nl_to_sql += fmt::format("Schema for {}: {}\n", name, sql_str.c_str());
     total_tables++;
   }
+  sqlite3_finalize(stmt);
 
   // Fail gracefully if no databases are present.
   if (total_tables == 0) {
     std::cout << prompt.c_str() << "you need to load a table first." << std::endl;
-    sqlite3_finalize(stmt);
     return false;
   }
 
@@ -337,6 +342,7 @@ static bool translateQuery(ai::aistream& ai,
       // Ignore indices where the query response is null, which could get us here.
     }
   }
+  sqlite3_finalize(stmt);
 #endif
   
   // Randomly sample values from the database.
@@ -402,8 +408,10 @@ static void real_ask_command(sqlite3_context *ctx, int argc, const char * query)
   std::string query_str (query);
   std::string sql_translation;
   
-  ai::aistream ai ({ .maxRetries = MAX_RETRIES_VALIDITY , .debug = DEBUG });
-  // ai::aistream ai ({ .maxRetries = 3 });
+  ai::aistream::params ai_params;
+  ai_params.maxRetries = MAX_RETRIES_VALIDITY;
+  ai_params.debug = DEBUG;
+  ai::aistream ai (ai_params);
 
   // ai << ai::config::GPT_3_5;
   // Switch to GPT 4
@@ -542,30 +550,38 @@ static void sqlwrite_command(sqlite3_context *ctx, int argc, sqlite3_value **arg
 extern "C" int sqlite3_sqlwrite_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi)
 {
   openai::start();
+  
+#ifndef SQLWRITE_AUTOLOAD
+  // Only use extension API when loaded dynamically
   SQLITE_EXTENSION_INIT2(pApi);
+#endif
     
   int rc;
 
   rc = sqlite3_create_function(db, "ask", -1, SQLITE_UTF8, db, &ask_command, NULL, NULL);
   if (rc != SQLITE_OK) {
-    *pzErrMsg = sqlite3_mprintf("Failed to create ask function: %s", sqlite3_errmsg(db));
+    if (pzErrMsg) *pzErrMsg = sqlite3_mprintf("Failed to create ask function: %s", sqlite3_errmsg(db));
     return rc;
   }
   rc = sqlite3_create_function(db, "sqlwrite", -1, SQLITE_UTF8, db, &sqlwrite_command, NULL, NULL);
   if (rc != SQLITE_OK) {
-    *pzErrMsg = sqlite3_mprintf("Failed to create sqlwrite function: %s", sqlite3_errmsg(db));
+    if (pzErrMsg) *pzErrMsg = sqlite3_mprintf("Failed to create sqlwrite function: %s", sqlite3_errmsg(db));
     return rc;
   }
-  const char* key = std::getenv("OPENAI_API_KEY");
-  if (!key) {
-    printf("To use SQLwrite, you must have an API key saved as the environment variable OPENAI_API_KEY.\n");
-    printf("For example, run `export OPENAI_API_KEY=sk-...`.\n");
-    printf("If you do not have a key, you can get one here: https://openai.com/api/.\n");
-    *pzErrMsg = sqlite3_mprintf("OPENAI_API_KEY environment variable not set.\n");
+  
+  // Check for credentials using the backend detection
+  auto backend = llm::create_backend();
+  if (!backend) {
+    printf("To use SQLwrite, you need API credentials:\n");
+    printf("  Option 1 (OpenAI): export OPENAI_API_KEY=sk-...\n");
+    printf("  Option 2 (AWS Bedrock): export AWS_ACCESS_KEY_ID=... or ~/.aws/credentials\n");
+    if (pzErrMsg) *pzErrMsg = sqlite3_mprintf("No API credentials found.\n");
     return SQLITE_ERROR;
   }
   
-  printf("SQLwrite extension successfully initialized.\nYou can now use natural language queries like \"select ask('show me all artists.');\".\nPlease report any issues to https://github.com/plasma-umass/sqlwrite/issues/new\n");
+  const char* provider = (llm::detect_provider() == llm::Provider::BEDROCK) ? "AWS Bedrock (Claude)" : "OpenAI";
+  printf("SQLwrite extension initialized with %s.\n", provider);
+  printf("Use natural language queries like: select ask('show me all artists.');\n");
 
   return SQLITE_OK;
 }

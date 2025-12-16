@@ -20511,6 +20511,19 @@ static void open_db(ShellState *p, int openFlags){
     }
 #endif
 
+#ifdef SQLWRITE_AUTOLOAD
+    /* Auto-load the SQLwrite extension */
+    {
+      extern int sqlite3_sqlwrite_init(sqlite3*, char**, const void*);
+      char *zErrMsg = 0;
+      int irc = sqlite3_sqlwrite_init(p->db, &zErrMsg, 0);
+      if( irc!=SQLITE_OK && zErrMsg ){
+        utf8_printf(stderr, "SQLwrite: %s\n", zErrMsg);
+        sqlite3_free(zErrMsg);
+      }
+    }
+#endif
+
     sqlite3_create_function(p->db, "shell_add_schema", 3, SQLITE_UTF8, 0,
                             shellAddSchemaName, 0, 0);
     sqlite3_create_function(p->db, "shell_module_schema", 1, SQLITE_UTF8, 0,
