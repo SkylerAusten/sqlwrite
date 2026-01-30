@@ -30,6 +30,12 @@
 #if !defined(MAX_RETRIES_VALIDITY)
 #define MAX_RETRIES_VALIDITY 5
 #endif
+#if !defined(NUM_CANDIDATES)
+#define NUM_CANDIDATES 3
+#endif
+#if !defined(MAX_OUTPUT_LINES)
+#define MAX_OUTPUT_LINES 5
+#endif
 
 #define LARGE_QUERY_THRESHOLD 10
 
@@ -154,6 +160,33 @@ int count_em(void* data, int c_num, char** c_vals, char** c_names) {
   }
   query_result += "\n";
   lines_printed++;
+  return 0;
+}
+
+struct truncated_print_data {
+  int lines_printed = 0;
+  int total_rows = 0;
+  int max_lines = MAX_OUTPUT_LINES;
+  std::string accumulated_output;
+};
+
+int truncated_print_em(void* data, int c_num, char** c_vals, char** c_names) {
+  auto* tpd = static_cast<truncated_print_data*>(data);
+  tpd->total_rows++;
+
+  std::string row;
+  for (int i = 0; i < c_num; i++) {
+    row += (c_vals[i] ? c_vals[i] : "");
+    if ((i < c_num - 1) && (c_num > 1)) {
+      row += "|";
+    }
+  }
+
+  if (tpd->lines_printed < tpd->max_lines) {
+    tpd->accumulated_output += row + "\n";
+    tpd->lines_printed++;
+  }
+
   return 0;
 }
 
@@ -282,25 +315,37 @@ std::list<std::string> rephraseQuery(ai::aistream& ai, const std::string& query,
   return rephrasedQueries;
 }
 
-static bool translateQuery(ai::aistream& ai,
+static bool translateCandidates(ai::aistream& ai,
 			   sqlite3_context *ctx,
 			   int argc,
 			   const char * query,
 			   json& json_response,
-			   std::string& sql_translation)
+			   std::vector<std::string>& sql_candidates)
 {
-  
+
   /* ---- build a query prompt to translate from natural language to SQL. ---- */
   // The prompt consists of all table names and schemas, plus any indexes, along with directions.
-  
+
   // Print all loaded database schemas
   sqlite3 *db = sqlite3_context_db_handle(ctx);
   sqlite3_stmt *stmt;
 
-  // auto nl_to_sql = fmt::format("Given a database with the following tables, schemas, and indexes, write a SQL query in SQLite's SQL dialect that answers this question or produces the desired report: '{}'. Produce a JSON object with the SQL query as a field \"SQL\". Offer a list of suggestions as SQL commands to create indexes that would improve query performance in a field \"Indexing\". Do so only if those indexes are not already given in 'Existing indexes'. Only produce output that can be parsed as JSON.\n\nSchemas:\n", query);
-  
-  auto nl_to_sql = fmt::format("Given a database with the following tables, schemas, indexes, and samples for each column, write a valid SQL query in SQLite's SQL dialect that answers this question or produces the desired report: '{}'. Produce a JSON object with the SQL query as a field \"SQL\". The produced query must only reference columns listed in the schemas. Offer a list of suggestions as SQL commands to create indexes that would improve query performance in a field \"Indexing\". Do so only if those indexes are not already given in 'Existing indexes'. Refer to the samples to form the query, taking into account format and capitalization. Only produce output that can be parsed as JSON.\n", query);
-  
+  auto nl_to_sql = fmt::format(
+    "Given a database with the following tables, schemas, indexes, and samples "
+    "for each column, write {} plausible SQL queries in SQLite's SQL dialect that "
+    "answer this question or produce the desired report: '{}'. "
+    "Each candidate should represent a different reasonable interpretation of the query. "
+    "Produce a JSON object with a field \"Candidates\" containing an array of objects, "
+    "each having a \"SQL\" field with the query and an \"Explanation\" field briefly "
+    "describing the interpretation. "
+    "Also include a field \"Indexing\" with a list of suggestions as SQL commands to "
+    "create indexes that would improve query performance. Do so only if those indexes "
+    "are not already given in 'Existing indexes'. "
+    "The produced queries must only reference columns listed in the schemas. "
+    "Refer to the samples to form the queries, taking into account format and "
+    "capitalization. Only produce output that can be parsed as JSON.\n",
+    NUM_CANDIDATES, query);
+
   sqlite3_prepare_v2(db, "SELECT name, sql FROM sqlite_master WHERE type='table' OR type='view'", -1, &stmt, NULL);
 
   auto total_tables = 0;
@@ -344,15 +389,15 @@ static bool translateQuery(ai::aistream& ai,
   }
   sqlite3_finalize(stmt);
 #endif
-  
+
   // Randomly sample values from the database.
 #if INCLUDE_RANDOM_SAMPLES
   auto sample_value_json = sampleSQLiteDistinct(db, 5); // magic number FIXME
   nl_to_sql += fmt::format("\nSample values for columns: {}\n", sample_value_json.dump(-1, ' ', false, json::error_handler_t::replace));
 #endif
-  
+
   /* ----  translate the natural language query to SQL and execute it (and request indexes) ---- */
-  
+
   ai << json({
       { "role", "assistant" },
 	{ "content", "You are a programming assistant who is an expert in generating SQL queries from natural language. You ONLY respond with JSON objects." }
@@ -362,43 +407,64 @@ static bool translateQuery(ai::aistream& ai,
       { "role", "user" },
 	{ "content", nl_to_sql.c_str() }
     });
-  
+
   ai << ai::validator([&](const json& j) {
     try {
-      // Ensure we got a SQL response.
-      sql_translation = j["SQL"].get<std::string>();
-      // Iterate through indexes to ensure validity.
-      for (auto& item : j["Indexing"]) {
-	volatile auto item_test = item.get<std::string>();
+      // Ensure we got a Candidates array.
+      auto& candidates = j["Candidates"];
+      if (!candidates.is_array() || candidates.empty()) {
+        return false;
       }
+
+      sql_candidates.clear();
+      for (auto& candidate : candidates) {
+        std::string sql = candidate["SQL"].get<std::string>();
+        // Verify explanation exists.
+        volatile auto explanation_test = candidate["Explanation"].get<std::string>();
+
+        // Clean up the SQL.
+        sql = removeEscapedNewlines(sql);
+        sql = removeEscapedCharacters(sql);
+
+        // Validate SQL by executing it.
+        auto rc = sqlite3_exec(db, sql.c_str(),
+            [](void*, int, char**, char**) { return 0; },
+            nullptr, nullptr);
+        if (rc != SQLITE_OK) {
+          if (DEBUG) {
+            std::cerr << fmt::format("{}Error executing candidate SQL \"{}\": {}\n",
+                prompt.c_str(), sql.c_str(), sqlite3_errmsg(db));
+          }
+          throw ai::exception(ai::exception_value::OTHER,
+              fmt::format("One of the candidate queries (\"{}\") caused SQLite to fail "
+                  "with this error: {}. Please regenerate all candidates with valid SQL.",
+                  sql, std::string(sqlite3_errmsg(db))));
+        }
+        sql_candidates.push_back(sql);
+      }
+
+      // Validate Indexing field.
+      for (auto& item : j["Indexing"]) {
+        volatile auto item_test = item.get<std::string>();
+      }
+    } catch (ai::exception&) {
+      throw;
     } catch (std::exception& e) {
       return false;
     }
-    // Remove any escaped newlines.
-    sql_translation = removeEscapedNewlines(sql_translation);
-    sql_translation = removeEscapedCharacters(sql_translation);
-    
-    // Send the query to the database.
-    auto rc = sqlite3_exec(db, sql_translation.c_str(), [](void*, int, char**, char**) {return 0;}, nullptr, nullptr);
-    if (rc != SQLITE_OK) {
-      if (DEBUG) {
-	std::cerr << fmt::format("{}Error executing SQL statement \"{}\":\n           {}\n", prompt.c_str(), sql_translation.c_str(), sqlite3_errmsg(db));
-      }
-      throw ai::exception(ai::exception_value::OTHER, fmt::format("The previous query (\"{}\") caused SQLite to fail with this error: {}.", std::string(sql_translation.c_str()), std::string(sqlite3_errmsg(db))));
-      // sqlite3_finalize(stmt);
-    }
-    return rc == SQLITE_OK;
+    return true;
   });
 
   json json_result;
   try {
     ai >> json_result;
   } catch (...) {
-    json_result = json({ {"SQL", ""}, {"Indexing", {} } });
+    json_result = json({ {"Candidates", json::array()}, {"Indexing", json::array()} });
     return false;
   }
+  json_response = json_result;
 
-  return true;
+  return !sql_candidates.empty();
 }
 
 static void real_ask_command(sqlite3_context *ctx, int argc, const char * query) { //  sqlite3_value **argv) {
@@ -406,127 +472,107 @@ static void real_ask_command(sqlite3_context *ctx, int argc, const char * query)
   sqlite3 *db = sqlite3_context_db_handle(ctx);
   json json_result;
   std::string query_str (query);
-  std::string sql_translation;
-  
+  std::vector<std::string> sql_candidates;
+
   ai::aistream::params ai_params;
   ai_params.maxRetries = MAX_RETRIES_VALIDITY;
   ai_params.debug = DEBUG;
   ai::aistream ai (ai_params);
 
-  // ai << ai::config::GPT_3_5;
-  // Switch to GPT 4
   ai << ai::config::GPT_4_0;
 
-#if RETRY_ON_EMPTY_RESULTS
-  int retriesRemaining = MAX_RETRIES_ON_RESULTS;
-#else
-  int retriesRemaining = 1;
-#endif
-  
-  bool updatedQuery = false;
-  
-  while (retriesRemaining) {
-    bool r = translateQuery(ai, ctx, argc, query_str.c_str(), json_result, sql_translation);
-    if (!r) {
-      std::cerr << prompt.c_str() << "Unfortunately, we were not able to successfully translate that query." << std::endl;
-      return;
-    }
-  
-    // Send the query to the database to count the number of lines.
-    lines_printed = 0;
-    query_result = "";
-    auto rc = sqlite3_exec(db, sql_translation.c_str(), count_em, nullptr, nullptr);
+  bool r = translateCandidates(ai, ctx, argc, query_str.c_str(), json_result, sql_candidates);
+  if (!r || sql_candidates.empty()) {
+    std::cerr << prompt.c_str() << "Unfortunately, we were not able to successfully translate that query." << std::endl;
+    return;
+  }
 
-    //std::cout << "Translated query: " << sql_translation << std::endl;
-    //std::cout << "Query result: " << query_result << std::endl;
-    
-    if ((lines_printed > 0) && (query_result != "0\n")) {
-#if RETRY_ON_TOO_MANY_RESULTS
-      if (lines_printed < LARGE_QUERY_THRESHOLD) {
-	// We got at least one result and not more than N - exit the retry loop.
-	break;
-      }
-#else
-      break;
-#endif
-    }
-    // Retry if we got an empty set of results.
-    retriesRemaining--;
+  // Display each candidate with truncated output.
+  auto& candidates_json = json_result["Candidates"];
+  for (size_t i = 0; i < sql_candidates.size(); i++) {
+    const auto& sql = sql_candidates[i];
 
-    if (!updatedQuery) {
-      if (lines_printed == 0) {
-	query_str += " The resulting SQL query should allow for fuzzy matches, including relaxing inequalities or making queries case-insensitive, in order to get the query to produce at least one result.";
-	updatedQuery = true;
-      }
-#if RETRY_ON_TOO_MANY_RESULTS
-      else if (lines_printed > LARGE_QUERY_THRESHOLD) {
-	query_str += fmt::format(" The resulting SQL query should probably be constrained, including sharpening inequalities, using INTERSECT or DISTINCT, to reduce the number of results.");
-	updatedQuery = true;
-      }
-#endif
+    // Get explanation if available.
+    std::string explanation;
+    if (i < candidates_json.size() && candidates_json[i].contains("Explanation")) {
+      explanation = candidates_json[i]["Explanation"].get<std::string>();
+    }
+
+    // Print candidate header.
+    std::cerr << fmt::format("\n{}--- Candidate {} of {} ---\n",
+        prompt.c_str(), i + 1, sql_candidates.size());
+
+    // Print the SQL.
+    std::cerr << fmt::format("{}SQL: {}\n", prompt.c_str(), sql.c_str());
+
+    // Print explanation if available.
+    if (!explanation.empty()) {
+      std::cerr << fmt::format("{}Interpretation: {}\n", prompt.c_str(), explanation.c_str());
+    }
+
+    // Execute with truncated output.
+    truncated_print_data tpd;
+    tpd.max_lines = MAX_OUTPUT_LINES;
+    auto rc = sqlite3_exec(db, sql.c_str(), truncated_print_em, &tpd, nullptr);
+
+    if (rc != SQLITE_OK) {
+      std::cerr << fmt::format("{}Error executing query: {}\n",
+          prompt.c_str(), sqlite3_errmsg(db));
+      continue;
+    }
+
+    // Print the accumulated (truncated) output.
+    if (tpd.lines_printed > 0) {
+      std::cout << tpd.accumulated_output;
+    }
+
+    // Show truncation indicator or empty result notice.
+    if (tpd.total_rows > tpd.max_lines) {
+      std::cerr << fmt::format("{}... ({} more rows, {} total)\n",
+          prompt.c_str(), tpd.total_rows - tpd.max_lines, tpd.total_rows);
+    } else if (tpd.total_rows == 0) {
+      std::cerr << fmt::format("{}(no results)\n", prompt.c_str());
     }
   }
-  // Actually print the results of the final query.
-  auto rc = sqlite3_exec(db, sql_translation.c_str(), print_em, nullptr, nullptr);
-  
-  // should be cout FIXME
-  std::cerr << fmt::format("{}translation to SQL:\n{}", prompt.c_str(), prefaceWithPrompt(sql_translation, prompt).c_str());
-  
-  if (json_result["Indexing"].size() > 0) {
-    std::cout << prompt.c_str() << "indexing suggestions to improve the performance for this query:" << std::endl;
-    int i = 0;
+
+  // Indexing suggestions (aggregate, once for all candidates).
+  if (json_result.contains("Indexing") && json_result["Indexing"].size() > 0) {
+    std::cout << "\n" << prompt.c_str() << "indexing suggestions to improve performance:" << std::endl;
+    int idx = 0;
     for (auto& item : json_result["Indexing"]) {
-      i++;
-      std::cout << fmt::format("({}): {}\n", i, item.get<std::string>());
+      idx++;
+      std::cout << fmt::format("({}): {}\n", idx, item.get<std::string>());
     }
   }
 
-  /* ----  translate the SQL query back to natural language ---- */
+  /* ----  translate the first candidate SQL back to natural language ---- */
 #if TRANSLATE_QUERY_BACK_TO_NL
-  ai.reset();
-  ai << json({
-      { "role", "assistant" },
-	{ "content", "You are a programming assistant who is an expert in translating SQL queries to natural language. You ONLY respond with JSON objects." }
-    });
+  if (!sql_candidates.empty()) {
+    ai.reset();
+    ai << json({
+        { "role", "assistant" },
+        { "content", "You are a programming assistant who is an expert in translating SQL queries to natural language. You ONLY respond with JSON objects." }
+      });
 
-  auto translate_to_natural_language_query = fmt::format("Given the following SQL query, convert it into natural language: '{}'. Produce a JSON object with the translation as a field \"Translation\". Only produce output that can be parsed as JSON.\n", sql_translation);
-  ai << json({
-      { "role", "user" },
-      { "content", translate_to_natural_language_query.c_str() }
+    auto translate_to_natural_language_query = fmt::format("Given the following SQL query, convert it into natural language: '{}'. Produce a JSON object with the translation as a field \"Translation\". Only produce output that can be parsed as JSON.\n", sql_candidates[0]);
+    ai << json({
+        { "role", "user" },
+        { "content", translate_to_natural_language_query.c_str() }
+      });
+    std::string translation;
+    ai << ai::validator([&](const json& j){
+      try {
+        translation = j["Translation"].get<std::string>();
+        return true;
+      } catch (std::exception& e) {
+        return false;
+      }
     });
-  std::string translation;
-  ai << ai::validator([&](const json& json_result){
-    try {
-      translation = json_result["Translation"].get<std::string>();
-      return true;
-    } catch (std::exception& e) {
-      return false;
-    }
-  });
-  ai >> json_result;
-  //  auto translation = json_result["Translation"].get<std::string>();
-  std::cout << fmt::format("{}translation back to natural language:\n{}", prompt.c_str(), prefaceWithPrompt(translation, prompt).c_str());
-#endif
-
- 
-#if 0 // disable temporarily
-  /* ---- get N translations from natural language to compare results ---- */
-  const auto N = 10;
-  auto rewordings = rephraseQuery(ai, sql_translation, N);
-  auto values = new const char *[N];
-  int i = 0;
-  for (const auto& w : rewordings) {
-    values[i] = w.c_str();
-    std::cerr << "Rewording " << i << " = " << (const char *) values[i] << std::endl;
-    i++;
+    json translate_result;
+    ai >> translate_result;
+    std::cout << fmt::format("\n{}translation of candidate 1 to natural language:\n{}", prompt.c_str(), prefaceWithPrompt(translation, prompt).c_str());
   }
-  std::cerr << "Trying " << values[0] << std::endl;
-  auto translated = translateQuery(ai, ctx, 1, values[0], json_result, sql_translation);
-  std::cout << "Done: translated = " << translated << std::endl;
-  // Cleanup allocated values
-  delete [] values;
 #endif
-  //  sqlite3_finalize(stmt);
 }
      
 static void ask_command(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
